@@ -99,17 +99,6 @@ def randomize(df):
         .drop('random'))
 
 
-def split(df, weights):
-    df = (df
-        .rdd
-        .zipWithIndex()
-        .map(lambda x: Row(index=x[1], **x[0].asDict()))
-        .toDF())
-    sum = __builtins__.sum
-    splits = ((sum(weights[:i]), sum(weights[:i+1])) for i in range(len(weights)))
-    return (df.filter('index >= %d and index < %d' % split).drop('index') for split in splits)
-
-
 def delete_data_source(spark, path):
     sc = spark.sparkContext
     config = sc._jsc.hadoopConfiguration()
@@ -123,32 +112,12 @@ def load_raw(spark, folder, days):
     str_fields = [StructField('_c%d' % i, StringType()) for i in CAT_COLS]
 
     schema = StructType(label_fields + int_fields + str_fields)
-
-    reader = (spark
+    paths = [os.path.join(folder, 'day_%d' % i) for i in range(days)]
+    return (spark
         .read
         .schema(schema)
         .option('sep', '\t')
-        .csv)
-
-    paths = [os.path.join(folder, 'day_%d' % i) for i in range(days)]
-    return reader(paths), [reader(path) for path in paths]
-
-
-def save_transformed(df, folder, day, mode=None):
-    path = os.path.join(folder, 'day_%d.parquet' % day)
-    df.write.parquet(path, mode=mode)
-
-
-def load_transformed(spark, folder, days):
-    reader = spark.read.parquet
-    paths = [os.path.join(folder, 'day_%d.parquet' % i) for i in range(days)]
-    return reader(*paths), [reader(path) for path in paths]
-
-
-def save_final(dfs, folder, mode=None):
-    for day, df in enumerate(dfs):
-        path = os.path.join(folder, 'day_%d.final' % day)
-        df.write.parquet(path, mode=mode)
+        .csv(paths))
 
 
 def load_combined_model(spark, model_folder):
@@ -204,7 +173,10 @@ def _parse_args():
     parser.add_argument('--frequency_limit')
     parser.add_argument('--transform_log', action='store_true')
     parser.add_argument('--broadcast_model', action='store_true')
-    parser.add_argument('--randomize', choices=['total', 'day'])
+    parser.add_argument(
+        '--randomize',
+        choices=['total', 'day', 'none'],
+        default='none')
 
     parser.add_argument('--debug_mode', action='store_true')
 
@@ -215,11 +187,11 @@ def _main():
     args = _parse_args()
     spark = SparkSession.builder.getOrCreate()
 
-    df_all, dfs = load_raw(spark, args.input_folder, args.days)
+    df = load_raw(spark, args.input_folder, args.days)
 
     with _timed('generate dicts'):
         save_combined_model(
-            get_combined_model(df_all, args.frequency_limit),
+            get_combined_model(df, args.frequency_limit),
             args.model_folder,
             args.write_mode)
         save_column_models(
@@ -229,29 +201,29 @@ def _main():
         if not args.debug_mode:
             delete_combined_model(spark, args.model_folder)
 
-    transformed_folder = 'transformed'
+    with _timed('transform and shuffle'):
+        if args.randomize != 'total':
+            df = df.withColumn('day', input_file_name())
 
-    with _timed('transform'):
-        models = list(load_column_models(spark, args.model_folder))
-        for day, df in enumerate(dfs):
-            df_encoded = apply_models(df, models, args.broadcast_model)
-            df_transformed = transform_log(df_encoded, args.transform_log)
-            save_transformed(df_transformed, transformed_folder, day, args.write_mode)
+        df = apply_models(
+            df,
+            load_column_models(spark, args.model_folder),
+            args.broadcast_model)
+        df = transform_log(df, args.transform_log)
 
-    df_all, dfs = load_transformed(spark, transformed_folder, args.days)
-    counts = [df.count() for df in dfs]
+        if args.randomize != 'none':
+            df = randomize(df)
 
-    if not args.randomize:
-        # TODO: upgrade the logic here
-        save_final(dfs, args.output_folder, args.write_mode)
+        if args.randomize == 'total':
+            df = df.repartition(args.days)
+            partitionBy = None
+        else:
+            partitionBy = 'day'
 
-    if args.randomize == 'total':
-        splits = split(randomize(df_all), counts)
-        save_final(splits, args.output_folder, args.write_mode)
-
-    if args.randomize == 'day':
-        splits = (randomize(df) for df in dfs)
-        save_final(splits, args.output_folder, args.write_mode)
+        df.write.parquet(
+            args.output_folder,
+            mode=args.write_mode,
+            partitionBy=partitionBy)
 
     print('=' * 100)
     print(_benchmark)
