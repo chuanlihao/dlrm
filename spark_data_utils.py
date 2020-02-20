@@ -215,7 +215,6 @@ def _main():
             df = randomize(df)
 
         if args.randomize == 'total':
-            df = df.repartition(args.days)
             partitionBy = None
         else:
             partitionBy = 'day'
