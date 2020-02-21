@@ -92,13 +92,6 @@ def transform_log(df, transform_log = False):
     return df.fillna(0, cols)
 
 
-def randomize(df):
-    return (df
-        .withColumn('random', rand())
-        .orderBy('random')
-        .drop('random'))
-
-
 def delete_data_source(spark, path):
     sc = spark.sparkContext
     config = sc._jsc.hadoopConfiguration()
@@ -171,11 +164,16 @@ def _parse_args():
         default='errorifexists')
 
     parser.add_argument('--frequency_limit')
-    parser.add_argument('--transform_log', action='store_true')
-    parser.add_argument('--broadcast_model', action='store_true')
+    parser.add_argument('--no_numeric_log_col', action='store_true')
+    parser.add_argument('--no_model_broadcast', action='store_true')
     parser.add_argument(
-        '--randomize',
-        choices=['total', 'day', 'none'],
+        '--output_ordering',
+        choices=['total_random', 'day_random', 'any', 'input'],
+        default='total_random')
+
+    parser.add_argument(
+        '--output_partitioning',
+        choices=['day', 'none'],
         default='none')
 
     parser.add_argument('--debug_mode', action='store_true')
@@ -202,22 +200,34 @@ def _main():
             delete_combined_model(spark, args.model_folder)
 
     with _timed('transform and shuffle'):
-        if args.randomize != 'total':
-            df = df.withColumn('day', input_file_name())
+        if args.output_ordering == 'day_random' or args.output_partitioning == 'day':
+            if args.output_ordering == 'total_random':
+                df = df.withColumn('day', (rand() * args.days).cast(IntegerType()))
+            else:
+                df = df.withColumn('day', input_file_name()) #TODO need to make this smaller
+
+        if args.output_ordering == 'day_random' or args.output_ordering == 'total_random':
+            df = df.withColumn('ordinal', rand())
+        elif args.output_ordering == 'input':
+            df = df.withColumn('ordinal', monotonically_increasing_id())
 
         df = apply_models(
             df,
             load_column_models(spark, args.model_folder),
-            args.broadcast_model)
-        df = transform_log(df, args.transform_log)
+            not args.no_model_broadcast)
+        df = transform_log(df, not args.no_numeric_log_col)
 
-        if args.randomize != 'none':
-            df = randomize(df)
+        if args.output_ordering != 'any':
+            if any ('day' in c for c in df.columns):
+                df = df.orderBy('day', 'ordinal')
+            else:
+                df = df.orderBy('ordinal')
+            df = df.drop('ordinal')
 
-        if args.randomize == 'total':
-            partitionBy = None
-        else:
+        if args.output_partitioning == 'day':
             partitionBy = 'day'
+        else:
+            partitionBy = None
 
         df.write.parquet(
             args.output_folder,
