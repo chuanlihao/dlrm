@@ -112,6 +112,33 @@ def load_raw(spark, folder, days):
         .option('sep', '\t')
         .csv(paths))
 
+def rand_ordinal(df):
+    # create a random long from the double precision float.  
+    # The fraction part of a double is 52 bits, so we try to capture as much
+    # of that as possible
+    return df.withColumn('ordinal', (rand() * (1 << 52)).cast(LongType()))
+
+def day_from_ordinal(df, num_days):
+    return df.withColumn('day', (col('ordinal') % num_days).cast(IntegerType()))
+
+def day_from_input_file(df):
+    return df.withColumn('day', substring_index(input_file_name(), '_', -1).cast(IntegerType()))
+
+def psudo_sort_by_day_plus(spark, df, num_days):
+    # Sort is very expensive because it needs to calculate the partitions
+    # which in our case may involve rereading all of the data.  In some cases
+    # we can avoid this by repartitioning the data and sorting within a single partition
+    shuffle_parts = int(spark.conf.get('spark.sql.shuffle.partitions'))
+    if shuffle_parts <= num_days:
+        df = df.repartition('day')
+    else:
+        #We want to spread out the computation to about the same amount as shuffle_parts
+        extra_parts = int(shuffle_parts/num_days)
+        divided = (col('ordinal') / num_days).cast(LongType())
+        extra_ident = divided % extra_parts
+        df = df.repartition(col('day'), extra_ident)
+    return df.sortWithinPartitions('day', 'ordinal')
+
 
 def load_combined_model(spark, model_folder):
     path = os.path.join(model_folder, 'combined.parquet')
@@ -200,34 +227,61 @@ def _main():
             delete_combined_model(spark, args.model_folder)
 
     with _timed('transform and shuffle'):
-        if args.output_ordering == 'day_random' or args.output_partitioning == 'day':
-            if args.output_ordering == 'total_random':
-                df = df.withColumn('day', (rand() * args.days).cast(IntegerType()))
-            else:
-                df = df.withColumn('day', input_file_name()) #TODO need to make this smaller
-
-        if args.output_ordering == 'day_random' or args.output_ordering == 'total_random':
-            df = df.withColumn('ordinal', rand())
+        if args.output_ordering == 'total_random':
+            df = rand_ordinal(df)
+            if args.output_partitioning == 'day':
+                df = day_from_ordinal(df, args.days)
+        elif args.output_ordering == 'day_random':
+            df = rand_ordinal(df)
+            df = day_from_input_file(df)
         elif args.output_ordering == 'input':
             df = df.withColumn('ordinal', monotonically_increasing_id())
+            if args.output_partitioning == 'day':
+                df = day_from_input_file(df)
+        else: # any ordering
+            if args.output_partitioning == 'day':
+                df = day_from_input_file(df)
 
+        
         df = apply_models(
             df,
             load_column_models(spark, args.model_folder),
             not args.no_model_broadcast)
         df = transform_log(df, not args.no_numeric_log_col)
 
-        if args.output_ordering != 'any':
-            if any ('day' in c for c in df.columns):
-                df = df.orderBy('day', 'ordinal')
-            else:
-                df = df.orderBy('ordinal')
-            df = df.drop('ordinal')
 
         if args.output_partitioning == 'day':
             partitionBy = 'day'
         else:
             partitionBy = None
+
+        if args.output_ordering == 'total_random':
+            if args.output_partitioning == 'day':
+                df = psudo_sort_by_day_plus(spark, df, args.days)
+            else: # none
+                # Don't do a full sort it is expensive. Order is random so
+                # just make it random
+                df = df.repartition('ordinal').sortWithinPartitions('ordinal')
+
+            df = df.drop('ordinal')
+        elif args.output_ordering == 'day_random':
+            df = psudo_sort_by_day_plus(spark, df, args.days)
+            df = df.drop('ordinal')
+            if args.output_partitioning != 'day':
+                df = df.drop('day')
+        elif args.output_ordering == 'input':
+            if args.no_model_broadcast:
+                # This is the slowest option. We totally messed up the order so we have to put
+                # it back in the correct order
+                df = df.orderBy('ordinal')
+            else:
+                # Applying the dictionary happened within a single task so we are already really
+                # close to the correct order, just need to sort within the partition
+                df = df.sortWithinPartitions('ordinal')
+            df = df.drop('ordinal')
+            if args.output_partitioning != 'day':
+                df = df.drop('day')
+        # else: any ordering so do nothing the ordering does not matter
 
         df.write.parquet(
             args.output_folder,
