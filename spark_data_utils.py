@@ -18,6 +18,7 @@ import os
 
 from argparse import ArgumentParser
 from contextlib import contextmanager
+from operator import itemgetter
 from time import time
 
 from pyspark import broadcast
@@ -31,7 +32,7 @@ INT_COLS = list(range(1, 14))
 CAT_COLS = list(range(14, 40))
 
 
-def get_combined_model(df, frequency_limit = None):
+def get_column_counts_with_frequency_limit(df, frequency_limit = None):
     cols = ['_c%d' % i for i in CAT_COLS]
     df = (df
         .select(posexplode(array(*cols)))
@@ -58,12 +59,45 @@ def get_combined_model(df, frequency_limit = None):
             # for comparing isin and separate filter
             # for i in remain:
             #     df = df.filter((col('column_id') != i - CAT_COLS[0]) | (col('count') >= default_limit))
+    return df
 
+def assign_id_with_window(df):
     windowed = Window.partitionBy('column_id').orderBy(desc('count'))
     return (df
-        .withColumn('id', row_number().over(windowed))
-        .drop('count'))
+            .withColumn('id', row_number().over(windowed))
+            .drop('count'))
 
+def assign_low_mem_partial_ids(df):
+    # To avoid some scaling issues with a simple window operation, we use a more complex method
+    # to compute the same thing, but in a more distributed spark specific way
+    df = df.orderBy(asc('column_id'), desc('count'))
+    # The monotonically_increasing_id is the partition id in the top 31 bits and the rest
+    # is an increasing count of the rows within that partition.  So we split it into two parts,
+    # the partion id part_id and the count mono_id
+    df = df.withColumn('part_id', spark_partition_id())
+    return df.withColumn('mono_id', monotonically_increasing_id() - shiftLeft(col('part_id'), 33))
+
+def assign_low_mem_final_ids(df):
+    # Now we can find the minimum and maximum mono_ids within a given column/partition pair
+    sub_model = df.groupBy('column_id', 'part_id').agg(max('mono_id').alias('top'), min('mono_id').alias('bottom'))
+    sub_model = sub_model.withColumn('diff', col('top') - col('bottom') + 1)
+    sub_model = sub_model.drop('top')
+    # This window function is over aggregated column/partition pair table. It will do a running sum of the rows
+    # within that column
+    windowed = Window.partitionBy('column_id').orderBy('part_id').rowsBetween(Window.unboundedPreceding, -1)
+    sub_model = sub_model.withColumn('running_sum', sum('diff').over(windowed)).na.fill(0, ["running_sum"])
+
+    joined = df.withColumnRenamed('column_id', 'i_column_id')
+    joined = joined.withColumnRenamed('part_id', 'i_part_id')
+
+    # Then we can join the original input with the pair it is a part of
+    joined = joined.join(sub_model, (col('i_column_id') == col('column_id')) & (col('part_id') == col('i_part_id')))
+
+    # So with all that we can subtract bottom from mono_id makeing it start at 0 for each partition
+    # and then add in the running_sum so the id is contiguous and unique for the entire column. + 1 to make it match the 1 based indexing
+    # for row_number
+    ret = joined.select(col('column_id'), col('data'), (col('mono_id') - col('bottom') + col('running_sum') + 1).cast(IntegerType()).alias('id'))
+    return ret
 
 def get_column_models(combined_model):
     for i in CAT_COLS:
@@ -74,7 +108,11 @@ def get_column_models(combined_model):
 
 
 def apply_models(df, models, broadcast_model = False):
-    for i, model in models:
+    if not broadcast_model:
+        # sort the models smallest to largest so
+        # we reduce the amount of shuffle data sooner than later
+        models = sorted(models, key=itemgetter(2))
+    for i, model, size in models:
         col_name = '_c%d' % i
         model = broadcast(model) if broadcast_model else model
         df = (df
@@ -129,11 +167,11 @@ def psudo_sort_by_day_plus(spark, df, num_days):
     # which in our case may involve rereading all of the data.  In some cases
     # we can avoid this by repartitioning the data and sorting within a single partition
     shuffle_parts = int(spark.conf.get('spark.sql.shuffle.partitions'))
-    if shuffle_parts <= num_days:
+    extra_parts = int(shuffle_parts/num_days)
+    if extra_parts <= 0:
         df = df.repartition('day')
     else:
         #We want to spread out the computation to about the same amount as shuffle_parts
-        extra_parts = int(shuffle_parts/num_days)
         divided = (col('ordinal') / num_days).cast(LongType())
         extra_ident = divided % extra_parts
         df = df.repartition(col('day'), extra_ident)
@@ -155,17 +193,31 @@ def delete_combined_model(spark, model_folder):
     delete_data_source(spark, path)
 
 
+def load_low_mem_partial_ids(spark, model_folder):
+    path = os.path.join(model_folder, 'partial_ids.parquet')
+    return spark.read.parquet(path)
+
+
+def save_low_mem_partial_ids(df, model_folder, mode=None):
+    path = os.path.join(model_folder, 'partial_ids.parquet')
+    df.write.parquet(path, mode=mode)
+
+
+def delete_low_mem_partial_ids(spark, model_folder):
+    path = os.path.join(model_folder, 'partial_ids.parquet')
+    delete_data_source(spark, path)
+
+
 def load_column_models(spark, model_folder):
     for i in CAT_COLS:
         path = os.path.join(model_folder, '%d.parquet' % i)
-        yield i, spark.read.parquet(path)
-
+        df = spark.read.parquet(path)
+        yield i, df, df.count()
 
 def save_column_models(column_models, model_folder, mode=None):
     for i, model in column_models:
         path = os.path.join(model_folder, '%d.parquet' % i)
         model.write.parquet(path, mode=mode)
-
 
 _benchmark = {}
 
@@ -192,7 +244,8 @@ def _parse_args():
 
     parser.add_argument('--frequency_limit')
     parser.add_argument('--no_numeric_log_col', action='store_true')
-    parser.add_argument('--no_model_broadcast', action='store_true')
+    #Support for running in a lower memory environment
+    parser.add_argument('--low_mem', action='store_true')
     parser.add_argument(
         '--output_ordering',
         choices=['total_random', 'day_random', 'any', 'input'],
@@ -215,10 +268,29 @@ def _main():
     df = load_raw(spark, args.input_folder, args.days)
 
     with _timed('generate dicts'):
-        save_combined_model(
-            get_combined_model(df, args.frequency_limit),
-            args.model_folder,
-            args.write_mode)
+        col_counts = get_column_counts_with_frequency_limit(df, args.frequency_limit)
+        if args.low_mem:
+            # in low memory mode we have to save an intermediate result
+            # because if we try to do it in one query spark ends up assigning the
+            # partial ids in two different locations that are not guaranteed to line up
+            # this prevents that from happening by assigning the partial ids
+            # and then writeing them out.
+            save_low_mem_partial_ids(
+                    assign_low_mem_partial_ids(col_counts),
+                    args.model_folder,
+                    args.write_mode)
+            save_combined_model(
+                    assign_low_mem_final_ids(load_low_mem_partial_ids(spark, args.model_folder)),
+                    args.model_folder,
+                    args.write_mode)
+            if not args.debug_mode:
+                delete_low_mem_partial_ids(spark, args.model_folder)
+
+        else:
+            save_combined_model(
+                    assign_id_with_window(col_counts),
+                    args.model_folder,
+                    args.write_mode)
         save_column_models(
             get_column_models(load_combined_model(spark, args.model_folder)),
             args.model_folder,
@@ -246,7 +318,7 @@ def _main():
         df = apply_models(
             df,
             load_column_models(spark, args.model_folder),
-            not args.no_model_broadcast)
+            not args.low_mem)
         df = transform_log(df, not args.no_numeric_log_col)
 
 
@@ -270,7 +342,7 @@ def _main():
             if args.output_partitioning != 'day':
                 df = df.drop('day')
         elif args.output_ordering == 'input':
-            if args.no_model_broadcast:
+            if args.low_mem:
                 # This is the slowest option. We totally messed up the order so we have to put
                 # it back in the correct order
                 df = df.orderBy('ordinal')
