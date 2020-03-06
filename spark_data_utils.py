@@ -61,11 +61,13 @@ def get_column_counts_with_frequency_limit(df, frequency_limit = None):
             #     df = df.filter((col('column_id') != i - CAT_COLS[0]) | (col('count') >= default_limit))
     return df
 
+
 def assign_id_with_window(df):
     windowed = Window.partitionBy('column_id').orderBy(desc('count'))
     return (df
             .withColumn('id', row_number().over(windowed))
-            .drop('count'))
+            .withColumnRenamed('count', 'model_count'))
+
 
 def assign_low_mem_partial_ids(df):
     # To avoid some scaling issues with a simple window operation, we use a more complex method
@@ -76,6 +78,7 @@ def assign_low_mem_partial_ids(df):
     # the partion id part_id and the count mono_id
     df = df.withColumn('part_id', spark_partition_id())
     return df.withColumn('mono_id', monotonically_increasing_id() - shiftLeft(col('part_id'), 33))
+
 
 def assign_low_mem_final_ids(df):
     # Now we can find the minimum and maximum mono_ids within a given column/partition pair
@@ -89,6 +92,7 @@ def assign_low_mem_final_ids(df):
 
     joined = df.withColumnRenamed('column_id', 'i_column_id')
     joined = joined.withColumnRenamed('part_id', 'i_part_id')
+    joined = joined.withColumnRenamed('count', 'model_count')
 
     # Then we can join the original input with the pair it is a part of
     joined = joined.join(sub_model, (col('i_column_id') == col('column_id')) & (col('part_id') == col('i_part_id')))
@@ -96,8 +100,12 @@ def assign_low_mem_final_ids(df):
     # So with all that we can subtract bottom from mono_id makeing it start at 0 for each partition
     # and then add in the running_sum so the id is contiguous and unique for the entire column. + 1 to make it match the 1 based indexing
     # for row_number
-    ret = joined.select(col('column_id'), col('data'), (col('mono_id') - col('bottom') + col('running_sum') + 1).cast(IntegerType()).alias('id'))
+    ret = joined.select(col('column_id'),
+                        col('data'),
+                        (col('mono_id') - col('bottom') + col('running_sum') + 1).cast(IntegerType()).alias('id'),
+                        col('model_count'))
     return ret
+
 
 def get_column_models(combined_model):
     for i in CAT_COLS:
@@ -107,18 +115,91 @@ def get_column_models(combined_model):
         yield i, model
 
 
-def apply_models(df, models, broadcast_model = False):
-    if not broadcast_model:
-        # sort the models smallest to largest so
-        # we reduce the amount of shuffle data sooner than later
-        models = sorted(models, key=itemgetter(2))
-    for i, model, size in models:
+def col_of_rand_long():
+    return (rand() * (1 << 52)).cast(LongType())
+
+def skewed_join(df, model, col_name, cutoff):
+    # Most versions of spark don't have a good way
+    # to deal with a skewed join out of the box.
+    # Some do and if you want to replace this with
+    # one of those that would be great.
+    
+    # Because we have statistics about the skewedness
+    # that we can used we divide the model up into two parts
+    # one part is the highly skewed part and we do a
+    # broadcast join for that part, but keep the result in
+    # a separate column
+    b_model = broadcast(model.filter(col('model_count') >= cutoff)
+            .withColumnRenamed('data', col_name)
+            .drop('model_count'))
+    
+    df = (df
+            .join(b_model, col_name, how='left')
+            .withColumnRenamed('id', 'id_tmp'))
+    
+    # We also need to spread the skewed data that matched
+    # evenly.  We will use a source of randomness for this
+    # but use a -1 for anything that still needs to be matched
+    if 'ordinal' in df.columns:
+        rand_column = col('ordinal')
+    else:
+        rand_column = col_of_rand_long()
+
+    df = df.withColumn('join_rand',
+            # null values are not in the model, they are filtered out
+            # but can be a source of skewedness so include them in
+            # the even distribution
+            when(col('id_tmp').isNotNull() | col(col_name).isNull(), rand_column)
+            .otherwise(lit(-1)))
+    
+    # Null out the string data that already matched to save memory
+    df = df.withColumn(col_name,
+            when(col('id_tmp').isNotNull(), None)
+            .otherwise(col(col_name)))
+    
+    # Now do the second join, which will be a non broadcast join.
+    # Sadly spark is too smart for its own good and will optimize out
+    # joining on a column it knows will always be a constant value.
+    # So we have to make a convoluted version of assigning a -1 to the
+    # randomness column for the model itself to work around that.
+    nb_model = (model
+            .withColumn('join_rand', when(col('model_count') < cutoff, lit(-1)).otherwise(lit(-2)))
+            .filter(col('model_count') < cutoff)
+            .withColumnRenamed('data', col_name)
+            .drop('model_count'))
+    
+    df = (df
+            .join(nb_model, ['join_rand', col_name], how='left')
+            .drop(col_name, 'join_rand')
+            # Pick either join result as an answer
+            .withColumn(col_name, coalesce(col('id'), col('id_tmp')))
+            .drop('id', 'id_tmp'))
+
+    return df
+
+
+def apply_models(df, models, broadcast_model = False, skew_broadcast_pct = 1.0):
+    # sort the models so broadcast joins come first. This is
+    # so we reduce the amount of shuffle data sooner than later
+    # If we parsed the string hex values to ints early on this would
+    # not make a difference.
+    models = sorted(models, key=itemgetter(3), reverse=True)
+    for i, model, original_rows, would_broadcast in models:
         col_name = '_c%d' % i
-        model = broadcast(model) if broadcast_model else model
-        df = (df
-            .join(model, col(col_name) == col('data'), how='left')
-            .drop(col_name, 'data')
-            .withColumnRenamed('id', col_name))
+        if not (would_broadcast or broadcast_model):
+            # The data is highly skewed so we need to offset that
+            cutoff = int(original_rows * skew_broadcast_pct/100.0)
+            df = skewed_join(df, model, col_name, cutoff)
+        else:
+            # broadcast joins can handle skewed data so no need to
+            # do anything special
+            model = (model.drop('model_count')
+                          .withColumnRenamed('data', col_name))
+            model = broadcast(model) if broadcast_model else model
+            df = (df
+                .join(model, col_name, how='left')
+                .drop(col_name)
+                .withColumnRenamed('id', col_name))
     return df.fillna(0, ['_c%d' % i for i in CAT_COLS])
 
 
@@ -129,6 +210,19 @@ def transform_log(df, transform_log = False):
             df = df.withColumn(col_name, log(df[col_name] + 1))
     return df.fillna(0, cols)
 
+
+def would_broadcast(spark, str_path):
+    sc = spark.sparkContext
+    config = sc._jsc.hadoopConfiguration()
+    path = sc._jvm.org.apache.hadoop.fs.Path(str_path)
+    fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(config)
+    stat = fs.listFiles(path, True)
+    sum = 0
+    while stat.hasNext():
+       sum = sum + stat.next().getLen()
+    sql_conf = sc._jvm.org.apache.spark.sql.internal.SQLConf()
+    cutoff = sql_conf.autoBroadcastJoinThreshold() * sql_conf.fileCompressionFactor()
+    return sum <= cutoff
 
 def delete_data_source(spark, path):
     sc = spark.sparkContext
@@ -154,7 +248,7 @@ def rand_ordinal(df):
     # create a random long from the double precision float.  
     # The fraction part of a double is 52 bits, so we try to capture as much
     # of that as possible
-    return df.withColumn('ordinal', (rand() * (1 << 52)).cast(LongType()))
+    return df.withColumn('ordinal', col_of_rand_long())
 
 def day_from_ordinal(df, num_days):
     return df.withColumn('day', (col('ordinal') % num_days).cast(IntegerType()))
@@ -212,7 +306,8 @@ def load_column_models(spark, model_folder):
     for i in CAT_COLS:
         path = os.path.join(model_folder, '%d.parquet' % i)
         df = spark.read.parquet(path)
-        yield i, df, df.count()
+        values = df.agg(sum('model_count').alias('sum')).collect()
+        yield i, df, values[0].sum, would_broadcast(spark, path)
 
 def save_column_models(column_models, model_folder, mode=None):
     for i, model in column_models:
@@ -258,6 +353,9 @@ def _parse_args():
 
     parser.add_argument('--debug_mode', action='store_true')
 
+    parser.add_argument('--dict_build_shuffle_parallel_per_day', type=int, default=2)
+    parser.add_argument('--apply_shuffle_parallel_per_day', type=int, default=25)
+    parser.add_argument('--skew_broadcast_pct', type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -267,6 +365,7 @@ def _main():
 
     df = load_raw(spark, args.input_folder, args.days)
 
+    spark.conf.set('spark.sql.shuffle.partitions', args.days * args.dict_build_shuffle_parallel_per_day)
     with _timed('generate dicts'):
         col_counts = get_column_counts_with_frequency_limit(df, args.frequency_limit)
         if args.low_mem:
@@ -298,6 +397,8 @@ def _main():
         if not args.debug_mode:
             delete_combined_model(spark, args.model_folder)
 
+
+    spark.conf.set('spark.sql.shuffle.partitions', args.days * args.apply_shuffle_parallel_per_day)
     with _timed('transform and shuffle'):
         if args.output_ordering == 'total_random':
             df = rand_ordinal(df)
@@ -318,7 +419,8 @@ def _main():
         df = apply_models(
             df,
             load_column_models(spark, args.model_folder),
-            not args.low_mem)
+            not args.low_mem,
+            args.skew_broadcast_pct)
         df = transform_log(df, not args.no_numeric_log_col)
 
 
