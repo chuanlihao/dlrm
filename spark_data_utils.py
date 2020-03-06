@@ -231,13 +231,13 @@ def delete_data_source(spark, path):
     sc._jvm.org.apache.hadoop.fs.FileSystem.get(config).delete(path, True)
 
 
-def load_raw(spark, folder, days):
+def load_raw(spark, folder, day_range):
     label_fields = [StructField('_c%d' % LABEL_COL, IntegerType())]
     int_fields = [StructField('_c%d' % i, IntegerType()) for i in INT_COLS]
     str_fields = [StructField('_c%d' % i, StringType()) for i in CAT_COLS]
 
     schema = StructType(label_fields + int_fields + str_fields)
-    paths = [os.path.join(folder, 'day_%d' % i) for i in range(days)]
+    paths = [os.path.join(folder, 'day_%d' % i) for i in day_range]
     return (spark
         .read
         .schema(schema)
@@ -328,9 +328,14 @@ def _timed(step):
 def _parse_args():
     parser = ArgumentParser()
 
-    parser.add_argument('--days', type=int, required=True)
+    parser.add_argument(
+        '--mode',
+        required=True,
+        choices=['generate_models', 'transform'])
+
+    parser.add_argument('--days', required=True)
     parser.add_argument('--input_folder', required=True)
-    parser.add_argument('--output_folder', required=True)
+    parser.add_argument('--output_folder')
     parser.add_argument('--model_folder', required=True)
     parser.add_argument(
         '--write_mode',
@@ -351,116 +356,124 @@ def _parse_args():
         choices=['day', 'none'],
         default='none')
 
-    parser.add_argument('--debug_mode', action='store_true')
-
     parser.add_argument('--dict_build_shuffle_parallel_per_day', type=int, default=2)
     parser.add_argument('--apply_shuffle_parallel_per_day', type=int, default=25)
     parser.add_argument('--skew_broadcast_pct', type=float, default=1.0)
-    return parser.parse_args()
+
+    parser.add_argument('--debug_mode', action='store_true')
+
+    args = parser.parse_args()
+
+    start, end = args.days.split('-')
+    args.day_range = list(range(int(start), int(end) + 1))
+    args.days = len(args.day_range)
+
+    return args
 
 
 def _main():
     args = _parse_args()
     spark = SparkSession.builder.getOrCreate()
 
-    df = load_raw(spark, args.input_folder, args.days)
+    df = load_raw(spark, args.input_folder, args.day_range)
 
-    spark.conf.set('spark.sql.shuffle.partitions', args.days * args.dict_build_shuffle_parallel_per_day)
-    with _timed('generate dicts'):
-        col_counts = get_column_counts_with_frequency_limit(df, args.frequency_limit)
-        if args.low_mem:
-            # in low memory mode we have to save an intermediate result
-            # because if we try to do it in one query spark ends up assigning the
-            # partial ids in two different locations that are not guaranteed to line up
-            # this prevents that from happening by assigning the partial ids
-            # and then writeing them out.
-            save_low_mem_partial_ids(
-                    assign_low_mem_partial_ids(col_counts),
-                    args.model_folder,
-                    args.write_mode)
-            save_combined_model(
-                    assign_low_mem_final_ids(load_low_mem_partial_ids(spark, args.model_folder)),
-                    args.model_folder,
-                    args.write_mode)
+    if args.mode == 'generate_models':
+        spark.conf.set('spark.sql.shuffle.partitions', args.days * args.dict_build_shuffle_parallel_per_day)
+        with _timed('generate models'):
+            col_counts = get_column_counts_with_frequency_limit(df, args.frequency_limit)
+            if args.low_mem:
+                # in low memory mode we have to save an intermediate result
+                # because if we try to do it in one query spark ends up assigning the
+                # partial ids in two different locations that are not guaranteed to line up
+                # this prevents that from happening by assigning the partial ids
+                # and then writeing them out.
+                save_low_mem_partial_ids(
+                        assign_low_mem_partial_ids(col_counts),
+                        args.model_folder,
+                        args.write_mode)
+                save_combined_model(
+                        assign_low_mem_final_ids(load_low_mem_partial_ids(spark, args.model_folder)),
+                        args.model_folder,
+                        args.write_mode)
+                if not args.debug_mode:
+                    delete_low_mem_partial_ids(spark, args.model_folder)
+
+            else:
+                save_combined_model(
+                        assign_id_with_window(col_counts),
+                        args.model_folder,
+                        args.write_mode)
+            save_column_models(
+                get_column_models(load_combined_model(spark, args.model_folder)),
+                args.model_folder,
+                args.write_mode)
             if not args.debug_mode:
-                delete_low_mem_partial_ids(spark, args.model_folder)
+                delete_combined_model(spark, args.model_folder)
 
-        else:
-            save_combined_model(
-                    assign_id_with_window(col_counts),
-                    args.model_folder,
-                    args.write_mode)
-        save_column_models(
-            get_column_models(load_combined_model(spark, args.model_folder)),
-            args.model_folder,
-            args.write_mode)
-        if not args.debug_mode:
-            delete_combined_model(spark, args.model_folder)
-
-
-    spark.conf.set('spark.sql.shuffle.partitions', args.days * args.apply_shuffle_parallel_per_day)
-    with _timed('transform and shuffle'):
-        if args.output_ordering == 'total_random':
-            df = rand_ordinal(df)
-            if args.output_partitioning == 'day':
-                df = day_from_ordinal(df, args.days)
-        elif args.output_ordering == 'day_random':
-            df = rand_ordinal(df)
-            df = day_from_input_file(df)
-        elif args.output_ordering == 'input':
-            df = df.withColumn('ordinal', monotonically_increasing_id())
-            if args.output_partitioning == 'day':
+    if args.mode == 'transform':
+        spark.conf.set('spark.sql.shuffle.partitions', args.days * args.apply_shuffle_parallel_per_day)
+        with _timed('transform'):
+            if args.output_ordering == 'total_random':
+                df = rand_ordinal(df)
+                if args.output_partitioning == 'day':
+                    df = day_from_ordinal(df, args.days)
+            elif args.output_ordering == 'day_random':
+                df = rand_ordinal(df)
                 df = day_from_input_file(df)
-        else: # any ordering
-            if args.output_partitioning == 'day':
-                df = day_from_input_file(df)
+            elif args.output_ordering == 'input':
+                df = df.withColumn('ordinal', monotonically_increasing_id())
+                if args.output_partitioning == 'day':
+                    df = day_from_input_file(df)
+            else: # any ordering
+                if args.output_partitioning == 'day':
+                    df = day_from_input_file(df)
 
         
-        df = apply_models(
-            df,
-            load_column_models(spark, args.model_folder),
-            not args.low_mem,
-            args.skew_broadcast_pct)
-        df = transform_log(df, not args.no_numeric_log_col)
+            df = apply_models(
+                df,
+                load_column_models(spark, args.model_folder),
+                not args.low_mem,
+                args.skew_broadcast_pct)
+            df = transform_log(df, not args.no_numeric_log_col)
 
 
-        if args.output_partitioning == 'day':
-            partitionBy = 'day'
-        else:
-            partitionBy = None
-
-        if args.output_ordering == 'total_random':
             if args.output_partitioning == 'day':
-                df = psudo_sort_by_day_plus(spark, df, args.days)
-            else: # none
-                # Don't do a full sort it is expensive. Order is random so
-                # just make it random
-                df = df.repartition('ordinal').sortWithinPartitions('ordinal')
-
-            df = df.drop('ordinal')
-        elif args.output_ordering == 'day_random':
-            df = psudo_sort_by_day_plus(spark, df, args.days)
-            df = df.drop('ordinal')
-            if args.output_partitioning != 'day':
-                df = df.drop('day')
-        elif args.output_ordering == 'input':
-            if args.low_mem:
-                # This is the slowest option. We totally messed up the order so we have to put
-                # it back in the correct order
-                df = df.orderBy('ordinal')
+                partitionBy = 'day'
             else:
-                # Applying the dictionary happened within a single task so we are already really
-                # close to the correct order, just need to sort within the partition
-                df = df.sortWithinPartitions('ordinal')
-            df = df.drop('ordinal')
-            if args.output_partitioning != 'day':
-                df = df.drop('day')
-        # else: any ordering so do nothing the ordering does not matter
+                partitionBy = None
 
-        df.write.parquet(
-            args.output_folder,
-            mode=args.write_mode,
-            partitionBy=partitionBy)
+            if args.output_ordering == 'total_random':
+                if args.output_partitioning == 'day':
+                    df = psudo_sort_by_day_plus(spark, df, args.days)
+                else: # none
+                    # Don't do a full sort it is expensive. Order is random so
+                    # just make it random
+                    df = df.repartition('ordinal').sortWithinPartitions('ordinal')
+
+                df = df.drop('ordinal')
+            elif args.output_ordering == 'day_random':
+                df = psudo_sort_by_day_plus(spark, df, args.days)
+                df = df.drop('ordinal')
+                if args.output_partitioning != 'day':
+                    df = df.drop('day')
+            elif args.output_ordering == 'input':
+                if args.low_mem:
+                    # This is the slowest option. We totally messed up the order so we have to put
+                    # it back in the correct order
+                    df = df.orderBy('ordinal')
+                else:
+                    # Applying the dictionary happened within a single task so we are already really
+                    # close to the correct order, just need to sort within the partition
+                    df = df.sortWithinPartitions('ordinal')
+                df = df.drop('ordinal')
+                if args.output_partitioning != 'day':
+                    df = df.drop('day')
+            # else: any ordering so do nothing the ordering does not matter
+
+            df.write.parquet(
+                args.output_folder,
+                mode=args.write_mode,
+                partitionBy=partitionBy)
 
     print('=' * 100)
     print(_benchmark)
